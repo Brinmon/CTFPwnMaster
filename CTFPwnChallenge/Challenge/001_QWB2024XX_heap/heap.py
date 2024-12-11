@@ -31,7 +31,6 @@ def debug():
 
 hint = b'>> '
 
-
 def add(idx, data):
     sla(hint, b'1')
     sla(b'idx', str(idx))

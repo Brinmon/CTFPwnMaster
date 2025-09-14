@@ -1,8 +1,8 @@
 {
-  description = "PWN Development Environment with pwndbg, pwntools and tmux";
+  description = "PWN Environment for nixpkgs 23.11 (pwndbg/pwntools/tmux)";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-23.11";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-23.11";  # 明确使用23.11版本
     flake-utils.url = "github:numtide/flake-utils";
   };
 
@@ -13,70 +13,76 @@
           inherit system;
           config = {
             allowUnfree = true;
-            multilib.enable = true;
+            glibcLocales.enable = true;  # 解决Locale问题
           };
         };
 
-        # 包含tmux的PWN工具集
+        # 核心工具集（23.11版本中pwndbg是独立包，非Python模块）
         pwnTools = with pkgs; [
-          # 调试工具
-          gdb
-          pwndbg
+          pwndbg                          # 独立的pwndbg包（23.11版本正确引用）
+          glibcLocales                    # Locale支持
+          netcat-openbsd                  # 网络调试
+          vim                             # 编辑工具
           
-          # 漏洞利用工具
+          # Python工具（23.11版本中这些包存在）
           python311Packages.pwntools
           python311Packages.ropper
           python311Packages.ropgadget
           python311Packages.angr
-          
-          # 辅助工具
-          tmux  # 新增tmux支持
+          python311Packages.pygments      # pwndbg依赖
+          python311Packages.six           # pwndbg依赖
         ];
+
+        # 关键：手动指定pwndbg的Python模块路径（23.11版本的正确路径）
+        pwndbgPythonDir = "${pkgs.pwndbg}/share/pwndbg";
       in {
         devShell = pkgs.mkShell {
           packages = pwnTools;
 
           shellHook = ''
-            echo "使用缓存的PWN环境，路径: $out"
-            
-            # 配置自定义.gdbinit文件
-            GDBINIT_PATH="$HOME/.gdbinit"
-            PWNDBG_PATH="${pkgs.pwndbg}/share/pwndbg/gdbinit.py"
-            
-            # 仅在.gdbinit不存在或内容不同时写入，避免重复操作
-            if [ ! -f "$GDBINIT_PATH" ] || ! grep -q "tmux split-window" "$GDBINIT_PATH"; then
-              echo "配置自定义.gdbinit文件..."
-              cat > "$GDBINIT_PATH" <<EOF
-set disassembly-flavor intel 
-source $PWNDBG_PATH
+            # 1. 解决Locale编码问题
+            export LOCALE_ARCHIVE="${pkgs.glibcLocales}/lib/locale/locale-archive"
+            export LC_ALL=en_US.UTF-8
+            export PYTHONIOENCODING=UTF-8
+            echo "[1/3] ✅ Locale配置完成"
 
+            # 2. 配置Python路径（让Python找到pwndbg模块）
+            export PYTHONPATH="$pwndbgPythonDir:$PYTHONPATH"
+            echo "[2/3] ✅ Python路径配置完成（已添加pwndbg模块）"
+
+            # 3. 配置.gdbinit（加载pwndbg+tmux分窗）
+            GDBINIT_PATH="$HOME/.gdbinit"
+            PWNDBG_GDBINIT="${pkgs.pwndbg}/share/pwndbg/gdbinit.py"
+
+            if [ ! -f "$GDBINIT_PATH" ] || ! grep -q "$PWNDBG_GDBINIT" "$GDBINIT_PATH"; then
+              echo "[3/3] ✅ 配置.gdbinit..."
+              cat > "$GDBINIT_PATH" <<EOF
+set disassembly-flavor intel
+source $PWNDBG_GDBINIT
 python
-import atexit
-import os
-from pwndbg.commands.context import contextoutput, output, clear_screen
-bt = os.popen('tmux split-window -P -F "#{pane_id}:#{pane_tty}" -d "cat -"').read().strip().split(":")
-st = os.popen(F'tmux split-window -h -t {bt[0]} -P -F '+'"#{pane_id}:#{pane_tty}" -d "cat -"').read().strip().split(":")
-re = os.popen(F'tmux split-window -h -t {st[0]} -P -F '+'"#{pane_id}:#{pane_tty}" -d "cat -"').read().strip().split(":")
-di = os.popen('tmux split-window -h -P -F "#{pane_id}:#{pane_tty}" -d "cat -"').read().strip().split(":")
-panes = dict(backtrace=bt, stack=st, regs=re, disasm=di)
-for sec, p in panes.items():
-    contextoutput(sec, p[1], True)
-contextoutput("legend", di[1], True)
-atexit.register(lambda: [os.popen(F"tmux kill-pane -t {p[0]}").read() for p in panes.values()])
+import atexit, os
+from pwndbg.commands.context import contextoutput
+bt = os.popen('tmux splitw -P -F "#{pane_id}:#{pane_tty}" -d cat').read().strip().split(":")
+st = os.popen(f'tmux splitw -h -t {bt[0]} -P -F "#{pane_id}:#{pane_tty}" -d cat').read().strip().split(":")
+regs = os.popen(f'tmux splitw -h -t {st[0]} -P -F "#{pane_id}:#{pane_tty}" -d cat').read().strip().split(":")
+disasm = os.popen('tmux splitw -h -P -F "#{pane_id}:#{pane_tty}" -d cat').read().strip().split(":")
+panes = {"backtrace": bt, "stack": st, "regs": regs, "disasm": disasm}
+for name, info in panes.items():
+    contextoutput(name, info[1], True)
+contextoutput("legend", disasm[1], True)
+atexit.register(lambda: [os.popen(f"tmux killp -t {p[0]}") for p in panes.values()])
 end
 EOF
+            else
+              echo "[3/3] ✅ .gdbinit已配置"
             fi
 
-            # 设置32位程序运行环境
-            export LD_LIBRARY_PATH="${pkgs.lib32.glibc}/lib:${pkgs.lib32.zlib}/lib:$LD_LIBRARY_PATH"
-            
-            # 验证关键工具是否可用
-            echo "验证环境..."
-            command -v tmux >/dev/null 2>&1 && echo "✓ tmux已安装" || echo "✗ tmux未安装"
-            command -v gdb >/dev/null 2>&1 && echo "✓ gdb已安装" || echo "✗ gdb未安装"
-            python3 -c "import pwn" >/dev/null 2>&1 && echo "✓ pwntools已安装" || echo "✗ pwntools未安装"
-            
-            echo "PWN环境准备就绪！使用tmux启动后运行gdb体验分窗调试"
+            # 验证环境
+            echo -e "\n=== 环境验证 ==="
+            python3 -c "import pwn" 2>/dev/null && echo "✅ pwntools" || echo "❌ pwntools"
+            command -v pwndbg >/dev/null && echo "✅ pwndbg" || echo "❌ pwndbg"
+            command -v tmux >/dev/null && echo "✅ tmux" || echo "❌ tmux"
+            echo "================\n"
           '';
         };
       });
